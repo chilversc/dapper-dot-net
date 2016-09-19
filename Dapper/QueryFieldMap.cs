@@ -42,14 +42,31 @@ namespace Dapper
 
         private static int[] CreateFieldToTypeMap(string[] prefixes, IDataReader reader)
         {
+            return CreateFieldToTypeMap(SortPrefixes(prefixes), reader);
+        }
+
+        private static int[] CreateFieldToTypeMap(FieldPrefix[] prefixes, IDataReader reader)
+        {
             var fieldsToType = new int[reader.FieldCount];
             for (var index = 0; index < fieldsToType.Length; index++)
             {
                 var fieldName = reader.GetName(index);
-                var typeIndex = Array.FindIndex(prefixes, prefix => fieldName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+                var prefixIndex = Array.FindIndex(prefixes, prefix => fieldName.StartsWith(prefix.Prefix, StringComparison.OrdinalIgnoreCase));
+                var typeIndex = prefixIndex < 0 ? -1 : prefixes[prefixIndex].TypeIndex;
                 fieldsToType[index] = typeIndex;
             }
             return fieldsToType;
+        }
+
+        private static FieldPrefix[] SortPrefixes(string[] prefixes)
+        {
+            var result = new FieldPrefix[prefixes.Length];
+            for (var index = 0; index < prefixes.Length; index++)
+            {
+                result[index] = new FieldPrefix(index, prefixes[index]);
+            }
+            Array.Sort(result);
+            return result;
         }
 
 
@@ -59,5 +76,21 @@ namespace Dapper
 
         public IEnumerator<FieldMap> GetEnumerator() => ((IEnumerable<FieldMap>)maps).GetEnumerator();
         IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+
+        private struct FieldPrefix : IComparable<FieldPrefix>
+        {
+            public readonly int TypeIndex;
+            public readonly string Prefix;
+
+            public FieldPrefix(int index, string prefix)
+            {
+                TypeIndex = index;
+                Prefix = prefix;
+            }
+
+            // sort backwards so that longer prefixes come first
+            public int CompareTo(FieldPrefix other) => -string.Compare(Prefix, other.Prefix, StringComparison.OrdinalIgnoreCase);
+        }
     }
 }
