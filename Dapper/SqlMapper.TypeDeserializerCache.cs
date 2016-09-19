@@ -48,7 +48,28 @@ namespace Dapper
                 }
                 return found.GetReader(reader, startBound, length, returnNullIfFirstMissing);
             }
+
+            internal static Func<IDataReader, object> GetReader(FieldMap map)
+            {
+                var type = map.Type;
+                var found = (TypeDeserializerCache)byType[type];
+                if (found == null)
+                {
+                    lock (byType)
+                    {
+                        found = (TypeDeserializerCache)byType[type];
+                        if (found == null)
+                        {
+                            byType[type] = found = new TypeDeserializerCache(type);
+                        }
+                    }
+                }
+                return found.GetReader2(map);
+            }
+
             private Dictionary<DeserializerKey, Func<IDataReader, object>> readers = new Dictionary<DeserializerKey, Func<IDataReader, object>>();
+            private Dictionary<FieldMap, Func<IDataReader, object>> mappedReader = new Dictionary<FieldMap, Func<IDataReader, object>>();
+
             struct DeserializerKey : IEquatable<DeserializerKey>
             {
                 private readonly int startBound, length;
@@ -134,6 +155,7 @@ namespace Dapper
                     return true;
                 }
             }
+
             private Func<IDataReader, object> GetReader(IDataReader reader, int startBound, int length, bool returnNullIfFirstMissing)
             {
                 if (length < 0) length = reader.FieldCount - startBound;
@@ -154,7 +176,22 @@ namespace Dapper
                     return readers[key] = deser;
                 }
             }
-        }
 
+            private Func<IDataReader, object> GetReader2(FieldMap map)
+            {
+                Func<IDataReader, object> deserializer;
+                lock (mappedReader)
+                {
+                    if (mappedReader.TryGetValue(map, out deserializer)) return deserializer;
+                }
+
+                deserializer = GetTypeDeserializerImpl(map);
+
+                lock (mappedReader)
+                {
+                    return mappedReader[map] = deserializer;
+                }
+            }
+        }
     }
 }

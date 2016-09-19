@@ -604,5 +604,21 @@ Order by p.Id
             public int BlogId { get; set; }
             public string Title { get; set; }
         }
+
+        [Fact]
+        public void TestMultiMappingWithColumnPrefix()
+        {
+            var sql = @"select 1 as ProductId, 'abc' as ProductName, 2 as CategoryId, 'def' as CategoryName";
+            var product = connection.Query<Product, Category, Product>(sql, (prod, cat) =>
+            {
+                prod.Category = cat;
+                return prod;
+            }, splitOn: "+Product, Category").First();
+            // assertions
+            product.Id.IsEqualTo(1);
+            product.Name.IsEqualTo("abc");
+            product.Category.Id.IsEqualTo(2);
+            product.Category.Name.IsEqualTo("def");
+        }
     }
 }

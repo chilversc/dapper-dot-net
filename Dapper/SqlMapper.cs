@@ -1433,8 +1433,21 @@ namespace Dapper
         {
             var deserializers = new List<Func<IDataReader, object>>();
             var splits = splitOn.Split(',').Select(s => s.Trim()).ToArray();
-                bool isMultiSplit = splits.Length > 1;
-            if (types.First() == typeof(object))
+            bool isMultiSplit = splits.Length > 1;
+            bool usePrefixes = splitOn.Length > 0 && splitOn[0] == '+';
+
+            if (usePrefixes)
+            {
+                // remove leading +
+                splits[0] = splits[0].Substring(1).Trim();
+                types = types.Where(t => t != typeof(DontMap)).ToArray();
+                var maps = new QueryFieldMap(types, splits, reader);
+                foreach (var fieldMap in maps)
+                {
+                    deserializers.Add(GetDeserializer(fieldMap));
+                }
+            }
+            else if (types.First() == typeof(object))
             {
                 // we go left to right for dynamic multi-mapping so that the madness of TestMultiMappingVariations
                 // is supported
@@ -1649,6 +1662,29 @@ namespace Dapper
             }
             return GetStructDeserializer(type, underlyingType ?? type, startBound);
         }
+
+        private static Func<IDataReader, object> GetDeserializer(FieldMap map)
+        {
+            var type = map.Type;
+            // dynamic is passed in as Object ... by c# design
+            if (type == typeof(object) || type == typeof(DapperRow))
+            {
+                return GetDapperRowDeserializer(map);
+            }
+            Type underlyingType = null;
+            if (!(typeMap.ContainsKey(type) || type.IsEnum() || type.FullName == LinqBinary ||
+                (type.IsValueType()  && (underlyingType = Nullable.GetUnderlyingType(type)) != null && underlyingType.IsEnum())))
+            {
+                ITypeHandler handler;
+                if (typeHandlers.TryGetValue(type, out handler))
+                {
+                    return GetHandlerDeserializer(handler, type, map.GetOrdinal(0));
+                }
+                return TypeDeserializerCache.GetReader(map);
+            }
+            return GetStructDeserializer(type, underlyingType ?? type, map.GetOrdinal(0));
+        }
+
         private static Func<IDataReader, object> GetHandlerDeserializer(ITypeHandler handler, Type type, int startBound)
         {
             return reader => handler.Parse(type, reader.GetValue(startBound));
@@ -1728,6 +1764,43 @@ namespace Dapper
                     return new DapperRow(table, values);
                 };
         }
+
+        internal static Func<IDataReader, object> GetDapperRowDeserializer(FieldMap map)
+        {
+            var length = map.Count;
+            DapperTable table = null;
+            return
+                r =>
+                {
+                    if (table == null)
+                    {
+                        string[] names = new string[length];
+                        for (int i = 0; i < length; i++)
+                        {
+                            names[i] = r.GetName(map.GetOrdinal(i));
+                        }
+                        table = new DapperTable(names);
+                    }
+
+                    if (map.ReturnNullIfFirstMissing)
+                    {
+                        if (r.IsDBNull(map.GetOrdinal(0)))
+                        {
+                            return null;
+                        }
+                    }
+
+                    var values = new object[length];
+                    for (int i = 0; i < values.Length; i++)
+                    {
+                        object val = r.GetValue(map.GetOrdinal(i));
+                        values[i] = val is DBNull ? null : val;
+                    }
+
+                    return new DapperRow(table, values);
+                };
+        }
+
         /// <summary>
         /// Internal use only
         /// </summary>
@@ -2881,6 +2954,7 @@ namespace Dapper
             }
             return found;
         }
+
         private static Func<IDataReader, object> GetTypeDeserializerImpl(
             Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnNullIfFirstMissing = false
         )
@@ -3162,6 +3236,331 @@ namespace Dapper
                     }
 
                     if (first && returnNullIfFirstMissing)
+                    {
+                        il.Emit(OpCodes.Pop);
+                        il.Emit(OpCodes.Ldnull); // stack is now [null]
+                        il.Emit(OpCodes.Stloc_1);
+                        il.Emit(OpCodes.Br, allDone);
+                    }
+
+                    il.MarkLabel(finishLabel);
+                }
+                first = false;
+                index += 1;
+            }
+            if (type.IsValueType())
+            {
+                il.Emit(OpCodes.Pop);
+            }
+            else
+            {
+                if (specializedConstructor != null)
+                {
+                    il.Emit(OpCodes.Newobj, specializedConstructor);
+                }
+                il.Emit(OpCodes.Stloc_1); // stack is empty
+#if !COREFX
+                if (supportInitialize)
+                {
+                    il.Emit(OpCodes.Ldloc_1);
+                    il.EmitCall(OpCodes.Callvirt, typeof(ISupportInitialize).GetMethod(nameof(ISupportInitialize.EndInit)), null);
+                }
+#endif
+            }
+            il.MarkLabel(allDone);
+            il.BeginCatchBlock(typeof(Exception)); // stack is Exception
+            il.Emit(OpCodes.Ldloc_0); // stack is Exception, index
+            il.Emit(OpCodes.Ldarg_0); // stack is Exception, index, reader
+            LoadLocal(il, valueCopyLocal); // stack is Exception, index, reader, value
+            il.EmitCall(OpCodes.Call, typeof(SqlMapper).GetMethod(nameof(SqlMapper.ThrowDataException)), null);
+            il.EndExceptionBlock();
+
+            il.Emit(OpCodes.Ldloc_1); // stack is [rval]
+            if (type.IsValueType())
+            {
+                il.Emit(OpCodes.Box, type);
+            }
+            il.Emit(OpCodes.Ret);
+
+            var funcType = System.Linq.Expressions.Expression.GetFuncType(typeof(IDataReader), returnType);
+            return (Func<IDataReader, object>)dm.CreateDelegate(funcType);
+        }
+
+        private static Func<IDataReader, object> GetTypeDeserializerImpl(FieldMap map)
+        {
+            var type = map.Type;
+            var returnType = type.IsValueType() ? typeof(object) : type;
+            var dm = new DynamicMethod("Deserialize" + Guid.NewGuid().ToString(), returnType, new[] { typeof(IDataReader) }, type, true);
+            var il = dm.GetILGenerator();
+            il.DeclareLocal(typeof(int));
+            il.DeclareLocal(type);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Stloc_0);
+
+            var length = map.Count;
+            var names = new string[length];
+            for (var i = 0; i < length; i++)
+            {
+                names[i] = map.GetName(i);
+            }
+
+            ITypeMap typeMap = GetTypeMap(type);
+
+            int index = 0;
+
+            ConstructorInfo specializedConstructor = null;
+
+#if !COREFX
+            bool supportInitialize = false;
+#endif
+            Dictionary<Type, LocalBuilder> structLocals = null;
+            if (type.IsValueType())
+            {
+                il.Emit(OpCodes.Ldloca_S, (byte)1);
+                il.Emit(OpCodes.Initobj, type);
+            }
+            else
+            {
+                var types2 = new Type[length];
+                for (int i = 0; i < length; i++)
+                {
+                    types2[i] = map.GetFieldType(i);
+                }
+
+                var explicitConstr = typeMap.FindExplicitConstructor();
+                if (explicitConstr != null)
+                {
+                    var consPs = explicitConstr.GetParameters();
+                    foreach (var p in consPs)
+                    {
+                        if (!p.ParameterType.IsValueType())
+                        {
+                            il.Emit(OpCodes.Ldnull);
+                        }
+                        else
+                        {
+                            GetTempLocal(il, ref structLocals, p.ParameterType, true);
+                        }
+                    }
+
+                    il.Emit(OpCodes.Newobj, explicitConstr);
+                    il.Emit(OpCodes.Stloc_1);
+#if !COREFX
+                    supportInitialize = typeof(ISupportInitialize).IsAssignableFrom(type);
+                    if (supportInitialize)
+                    {
+                        il.Emit(OpCodes.Ldloc_1);
+                        il.EmitCall(OpCodes.Callvirt, typeof(ISupportInitialize).GetMethod(nameof(ISupportInitialize.BeginInit)), null);
+                    }
+#endif
+                }
+                else
+                {
+                    var ctor = typeMap.FindConstructor(names, types2);
+                    if (ctor == null)
+                    {
+                        string proposedTypes = "(" + string.Join(", ", types2.Select((t, i) => t.FullName + " " + names[i])) + ")";
+                        throw new InvalidOperationException($"A parameterless default constructor or one matching signature {proposedTypes} is required for {type.FullName} materialization");
+                    }
+
+                    if (ctor.GetParameters().Length == 0)
+                    {
+                        il.Emit(OpCodes.Newobj, ctor);
+                        il.Emit(OpCodes.Stloc_1);
+#if !COREFX
+                        supportInitialize = typeof(ISupportInitialize).IsAssignableFrom(type);
+                        if (supportInitialize)
+                        {
+                            il.Emit(OpCodes.Ldloc_1);
+                            il.EmitCall(OpCodes.Callvirt, typeof(ISupportInitialize).GetMethod(nameof(ISupportInitialize.BeginInit)), null);
+                        }
+#endif
+                    }
+                    else
+                    {
+                        specializedConstructor = ctor;
+                    }
+                }
+            }
+
+            il.BeginExceptionBlock();
+            if (type.IsValueType())
+            {
+                il.Emit(OpCodes.Ldloca_S, (byte)1);// [target]
+            }
+            else if (specializedConstructor == null)
+            {
+                il.Emit(OpCodes.Ldloc_1);// [target]
+            }
+
+            var members = (specializedConstructor != null
+                ? names.Select(n => typeMap.GetConstructorParameter(specializedConstructor, n))
+                : names.Select(n => typeMap.GetMember(n))).ToList();
+
+            // stack is now [target]
+
+            bool first = true;
+            var allDone = il.DefineLabel();
+            int enumDeclareLocal = -1, valueCopyLocal = il.DeclareLocal(typeof(object)).LocalIndex;
+            bool applyNullSetting = Settings.ApplyNullValues;
+            foreach (var item in members)
+            {
+                if (item != null)
+                {
+                    if (specializedConstructor == null)
+                        il.Emit(OpCodes.Dup); // stack is now [target][target]
+                    Label isDbNullLabel = il.DefineLabel();
+                    Label finishLabel = il.DefineLabel();
+
+                    il.Emit(OpCodes.Ldarg_0); // stack is now [target][target][reader]
+                    EmitInt32(il, map.GetOrdinal(index)); // stack is now [target][target][reader][field-ordinal]
+                    il.Emit(OpCodes.Dup);// stack is now [target][target][reader][index][index]
+                    il.Emit(OpCodes.Stloc_0);// stack is now [target][target][reader][index]
+                    il.Emit(OpCodes.Callvirt, getItem); // stack is now [target][target][value-as-object]
+                    il.Emit(OpCodes.Dup); // stack is now [target][target][value-as-object][value-as-object]
+                    StoreLocal(il, valueCopyLocal);
+                    Type colType = map.GetFieldType(index);
+                    Type memberType = item.MemberType;
+
+                    if (memberType == typeof(char) || memberType == typeof(char?))
+                    {
+                        il.EmitCall(OpCodes.Call, typeof(SqlMapper).GetMethod(
+                            memberType == typeof(char) ? nameof(SqlMapper.ReadChar) : nameof(SqlMapper.ReadNullableChar), BindingFlags.Static | BindingFlags.Public), null); // stack is now [target][target][typed-value]
+                    }
+                    else
+                    {
+                        il.Emit(OpCodes.Dup); // stack is now [target][target][value][value]
+                        il.Emit(OpCodes.Isinst, typeof(DBNull)); // stack is now [target][target][value-as-object][DBNull or null]
+                        il.Emit(OpCodes.Brtrue_S, isDbNullLabel); // stack is now [target][target][value-as-object]
+
+                        // unbox nullable enums as the primitive, i.e. byte etc
+
+                        var nullUnderlyingType = Nullable.GetUnderlyingType(memberType);
+                        var unboxType = nullUnderlyingType != null && nullUnderlyingType.IsEnum() ? nullUnderlyingType : memberType;
+
+                        if (unboxType.IsEnum())
+                        {
+                            Type numericType = Enum.GetUnderlyingType(unboxType);
+                            if (colType == typeof(string))
+                            {
+                                if (enumDeclareLocal == -1)
+                                {
+                                    enumDeclareLocal = il.DeclareLocal(typeof(string)).LocalIndex;
+                                }
+                                il.Emit(OpCodes.Castclass, typeof(string)); // stack is now [target][target][string]
+                                StoreLocal(il, enumDeclareLocal); // stack is now [target][target]
+                                il.Emit(OpCodes.Ldtoken, unboxType); // stack is now [target][target][enum-type-token]
+                                il.EmitCall(OpCodes.Call, typeof(Type).GetMethod(nameof(Type.GetTypeFromHandle)), null);// stack is now [target][target][enum-type]
+                                LoadLocal(il, enumDeclareLocal); // stack is now [target][target][enum-type][string]
+                                il.Emit(OpCodes.Ldc_I4_1); // stack is now [target][target][enum-type][string][true]
+                                il.EmitCall(OpCodes.Call, enumParse, null); // stack is now [target][target][enum-as-object]
+                                il.Emit(OpCodes.Unbox_Any, unboxType); // stack is now [target][target][typed-value]
+                            }
+                            else
+                            {
+                                FlexibleConvertBoxedFromHeadOfStack(il, colType, unboxType, numericType);
+                            }
+
+                            if (nullUnderlyingType != null)
+                            {
+                                il.Emit(OpCodes.Newobj, memberType.GetConstructor(new[] { nullUnderlyingType })); // stack is now [target][target][typed-value]
+                            }
+                        }
+                        else if (memberType.FullName == LinqBinary)
+                        {
+                            il.Emit(OpCodes.Unbox_Any, typeof(byte[])); // stack is now [target][target][byte-array]
+                            il.Emit(OpCodes.Newobj, memberType.GetConstructor(new Type[] { typeof(byte[]) }));// stack is now [target][target][binary]
+                        }
+                        else
+                        {
+                            TypeCode dataTypeCode = TypeExtensions.GetTypeCode(colType), unboxTypeCode = TypeExtensions.GetTypeCode(unboxType);
+                            bool hasTypeHandler;
+                            if ((hasTypeHandler = typeHandlers.ContainsKey(unboxType)) || colType == unboxType || dataTypeCode == unboxTypeCode || dataTypeCode == TypeExtensions.GetTypeCode(nullUnderlyingType))
+                            {
+                                if (hasTypeHandler)
+                                {
+#pragma warning disable 618
+                                    il.EmitCall(OpCodes.Call, typeof(TypeHandlerCache<>).MakeGenericType(unboxType).GetMethod(nameof(TypeHandlerCache<int>.Parse)), null); // stack is now [target][target][typed-value]
+#pragma warning restore 618
+                                }
+                                else
+                                {
+                                    il.Emit(OpCodes.Unbox_Any, unboxType); // stack is now [target][target][typed-value]
+                                }
+                            }
+                            else
+                            {
+                                // not a direct match; need to tweak the unbox
+                                FlexibleConvertBoxedFromHeadOfStack(il, colType, nullUnderlyingType ?? unboxType, null);
+                                if (nullUnderlyingType != null)
+                                {
+                                    il.Emit(OpCodes.Newobj, unboxType.GetConstructor(new[] { nullUnderlyingType })); // stack is now [target][target][typed-value]
+                                }
+                            }
+                        }
+                    }
+                    if (specializedConstructor == null)
+                    {
+                        // Store the value in the property/field
+                        if (item.Property != null)
+                        {
+                            il.Emit(type.IsValueType() ? OpCodes.Call : OpCodes.Callvirt, DefaultTypeMap.GetPropertySetter(item.Property, type));
+                        }
+                        else
+                        {
+                            il.Emit(OpCodes.Stfld, item.Field); // stack is now [target]
+                        }
+                    }
+
+                    il.Emit(OpCodes.Br_S, finishLabel); // stack is now [target]
+
+                    il.MarkLabel(isDbNullLabel); // incoming stack: [target][target][value]
+                    if (specializedConstructor != null)
+                    {
+                        il.Emit(OpCodes.Pop);
+                        if (item.MemberType.IsValueType())
+                        {
+                            int localIndex = il.DeclareLocal(item.MemberType).LocalIndex;
+                            LoadLocalAddress(il, localIndex);
+                            il.Emit(OpCodes.Initobj, item.MemberType);
+                            LoadLocal(il, localIndex);
+                        }
+                        else
+                        {
+                            il.Emit(OpCodes.Ldnull);
+                        }
+                    }
+                    else if (applyNullSetting && (!memberType.IsValueType() || Nullable.GetUnderlyingType(memberType) != null))
+                    {
+                        il.Emit(OpCodes.Pop); // stack is now [target][target]
+                        // can load a null with this value
+                        if (memberType.IsValueType())
+                        { // must be Nullable<T> for some T
+                            GetTempLocal(il, ref structLocals, memberType, true); // stack is now [target][target][null]
+                        }
+                        else
+                        { // regular reference-type
+                            il.Emit(OpCodes.Ldnull); // stack is now [target][target][null]
+                        }
+
+                        // Store the value in the property/field
+                        if (item.Property != null)
+                        {
+                            il.Emit(type.IsValueType() ? OpCodes.Call : OpCodes.Callvirt, DefaultTypeMap.GetPropertySetter(item.Property, type));
+                            // stack is now [target]
+                        }
+                        else
+                        {
+                            il.Emit(OpCodes.Stfld, item.Field); // stack is now [target]
+                        }
+                    }
+                    else
+                    {
+                        il.Emit(OpCodes.Pop); // stack is now [target][target]
+                        il.Emit(OpCodes.Pop); // stack is now [target]
+                    }
+
+                    if (first && map.ReturnNullIfFirstMissing)
                     {
                         il.Emit(OpCodes.Pop);
                         il.Emit(OpCodes.Ldnull); // stack is now [null]
