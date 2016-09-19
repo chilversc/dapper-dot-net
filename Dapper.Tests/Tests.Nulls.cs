@@ -1,5 +1,8 @@
 ﻿using Xunit;
 using System.Linq;
+using System.Data;
+using System;
+
 namespace Dapper.Tests
 {
     public partial class TestSuite
@@ -78,6 +81,41 @@ select * from @data").ToDictionary(_ => _.Id);
                 C = "def";
                 D = AnEnum.B;
                 E = AnEnum.B;
+            }
+        }
+
+        [Fact]
+        public void Issue224_ScalarTypeHandlerNullable()
+        {
+            SqlMapper.ResetTypeHandlers();
+            SqlMapper.AddTypeHandler(new MoneyTypeHandler());
+            var result = connection.Query<Money?>("SELECT NULL").Single();
+            Assert.IsNull(result);
+        }
+
+        struct Money
+        {
+            private readonly int value;
+
+            public Money(int value)
+            {
+                this.value = value;
+            }
+
+            public int Value => value;
+        }
+
+        class MoneyTypeHandler : SqlMapper.TypeHandler<Money>
+        {
+            public override void SetValue(IDbDataParameter p, Money value)
+            {
+                p.DbType = DbType.Int32;
+                p.Value = value.Value;
+            }
+
+            public override Money Parse(object obj)
+            {
+                return new Money((int)obj);
             }
         }
     }

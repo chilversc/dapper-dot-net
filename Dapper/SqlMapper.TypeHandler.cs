@@ -38,7 +38,14 @@ namespace Dapper
 
             object ITypeHandler.Parse(Type destinationType, object value)
             {
-                return Parse(value);
+                if (value is DBNull)
+                {
+                    return null;
+                }
+                else
+                {
+                    return Parse(value);
+                }
             }
         }
         /// <summary>
